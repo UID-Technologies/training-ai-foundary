@@ -24,7 +24,7 @@ A travel coordinator asks, “What is the weather in Pune right now?” The MCP 
 ```bash
 mkdir mcp-weather-lab
 cd mcp-weather-lab
-uv init --python 3.11
+uv init --python 3.11    or     uv init --no-package
 uv add "mcp[cli]>=2,<3"
 ```
 
