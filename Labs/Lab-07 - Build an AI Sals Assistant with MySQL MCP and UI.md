@@ -1,7 +1,5 @@
-# Lab 06 — Build an AI Sales Assistant over MySQL with MCP
+# Lab 07 — Build an AI Sales Assistant over MySQL, MCP and UI
 
-> Training series: [UID Technologies — Microsoft Foundry Labs](https://github.com/UID-Technologies/training-ai-foundary/tree/master/Labs)  
-> Canonical lab name in the pack: `Lab-06 - AI Sales Assistant with MySQL MCP.md`
 
 ## Goal
 

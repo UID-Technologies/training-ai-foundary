@@ -1,7 +1,5 @@
 # Lab 05 — Extended: Build a Weather Assistant with Streamlit UI + MCP Server
 
-> **Course pack:** [UID-Technologies/training-ai-foundary — Labs](https://github.com/UID-Technologies/training-ai-foundary/tree/master/Labs)  
-> **Prerequisite lab:** [Lab 05 — Public API Weather MCP](https://github.com/UID-Technologies/training-ai-foundary/blob/master/Labs/Lab-05%20-%20Public%20API%20Weather%20MCP.md) (standalone MCP server + CLI client)
 
 ## Goal
 
