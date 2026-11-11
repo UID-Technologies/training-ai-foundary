@@ -1,171 +1,236 @@
-# Lab 05 — Build a Weather Assistant with a Public API
+# Lab 05 — Extended: Build a Weather Assistant with Streamlit UI + MCP Server
+
+> **Course pack:** [UID-Technologies/training-ai-foundary — Labs](https://github.com/UID-Technologies/training-ai-foundary/tree/master/Labs)  
+> **Prerequisite lab:** [Lab 05 — Public API Weather MCP](https://github.com/UID-Technologies/training-ai-foundary/blob/master/Labs/Lab-05%20-%20Public%20API%20Weather%20MCP.md) (standalone MCP server + CLI client)
 
 ## Goal
 
-Create an independent MCP server that uses Open-Meteo's public geocoding and forecast APIs. A user or AI host can ask for a city's current weather and receive a concise, structured summary.
+Extend the Weather MCP lab into a complete application where users enter a city in a **Streamlit** web UI, submit a weather request, and receive live weather from the MCP server.
+
+Streamlit acts as an **MCP client** — it does **not** call Open-Meteo directly. This shows how a real frontend can use MCP tools **without** an LLM or AI agent.
 
 ## Practical scenario
 
-A travel coordinator asks, “What is the weather in Pune right now?” The MCP tool resolves the city name to coordinates, retrieves current conditions, and returns only the useful fields. No API key is required for this learning exercise. Review Open-Meteo's current terms and attribution requirements before production use.
+A travel desk employee opens an internal weather page, types **Pune**, and clicks **Get Weather**. The browser talks to Streamlit; Streamlit starts the MCP server over stdio, calls `get_current_weather`, and renders a dashboard. Operations can verify the same flow with `client.py` without opening the browser.
 
 ## What you will learn
 
-- Wrap a REST API call in an MCP tool.
-- Validate input, handle missing locations, and apply an HTTP timeout.
-- Keep API integration logic behind a narrow tool interface.
-- Test a tool independently from any language model.
+- Separate **UI**, **MCP client**, **MCP server**, and **external API** into clear layers.
+- Use the Python MCP SDK (`MCPServer`, `ClientSession`, `stdio_client`) on MCP **2.x**.
+- Expose multiple tools from one server (`get_current_weather`, `get_weather_brief`).
+- Build a Streamlit form that invokes MCP tools asynchronously.
+- Test end-to-end behavior including validation and error paths.
 
 ## Time and prerequisites
 
-60–75 minutes. Python 3.11+, internet access, and a terminal. This lab does not use Lab 01's files.
+**90–120 minutes.** Python **3.11+**, internet access, and a terminal.  
+**Optional:** complete base Lab 05 first (same `server.py` concepts).
 
-## Step 1 — Create a new project
+Install **uv** (recommended) or use `venv` + `pip`. No Azure account, API key, or paid weather API is required.
 
-```bash
+## Application architecture
+
+```text
+Streamlit Web UI (app.py)
+        │  city + response type
+        ▼
+MCP Python client (mcp_client.py) · stdio transport
+        │  list_tools / call_tool
+        ▼
+Python MCP Server (server.py)
+        │  get_current_weather · get_weather_brief
+        ▼
+Open-Meteo (geocoding + forecast) · HTTPS · JSON
+```
+
+| Layer             | Technology                          |
+| ----------------- | ----------------------------------- |
+| Frontend          | Streamlit                           |
+| MCP client        | Python MCP SDK (`ClientSession`)    |
+| MCP server        | `MCPServer` (MCP SDK v2)            |
+| Transport         | stdio (local development)           |
+| External provider | Open-Meteo                          |
+| Data format       | JSON                                |
+| AI model          | **Not required**                    |
+
+**Important:** With stdio, the MCP client **launches** `server.py` as a subprocess. You do not need a separate terminal running the server for each UI request (this lab starts a new session per request).
+
+## Project structure
+
+```text
+mcp-weather-lab/
+│
+├── server.py           # MCP server and weather tools
+├── mcp_client.py       # Reusable MCP client
+├── app.py              # Streamlit UI
+├── client.py           # CLI test (no Streamlit)
+├── pyproject.toml
+├── lab.md              # This guide
+├── README.md
+└── .venv/
+```
+
+## Step 1 — Create project and install dependencies
+
+Open PowerShell or a terminal:
+
+```powershell
 mkdir mcp-weather-lab
 cd mcp-weather-lab
+
 uv init --python 3.11
-uv add "mcp[cli]>=2,<3"
+uv add "mcp[cli]>=2,<3" streamlit
 ```
 
-## Step 2 — Create `server.py`
+If `uv` is not on PATH, install it from [https://docs.astral.sh/uv/getting-started/installation/](https://docs.astral.sh/uv/getting-started/installation/) and ensure `C:\Users\<you>\.local\bin` is on your user **Path**.
+
+**Without uv:**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install "mcp[cli]>=2,<3" streamlit
+```
+
+On Linux/macOS: `source .venv/bin/activate`.
+
+## Step 2 — Update the MCP server (`server.py`)
+
+Implement shared `fetch_weather(city)` for geocoding + current conditions, then expose two tools:
+
+| Tool                   | Returns                                              |
+| ---------------------- | ---------------------------------------------------- |
+| `get_current_weather`  | JSON string with structured fields (temp, wind, …)   |
+| `get_weather_brief`    | One travel-friendly sentence (WMO weather code text) |
+
+Design notes:
+
+- `get_json()` uses `urllib` with a **15-second timeout** and a clear `User-Agent`.
+- Validation: empty city, length 2–100 characters, unknown location.
+- `ValueError` / `RuntimeError` from `fetch_weather` are converted to user-facing messages inside tools (so Streamlit gets warnings, not raw tracebacks).
+- Entry point: `mcp.run()` for stdio (do not `print()` to stdout — it is the MCP wire).
+
+Use the `server.py` in this repository as the reference implementation.
+
+### Walk through the server flow
+
+1. User supplies a city via MCP tool arguments.
+2. Geocoding API resolves name → coordinates (prefer exact name match).
+3. Forecast API returns `current` block for that timezone.
+4. Tools return JSON or a brief string to the MCP client.
+
+## Step 3 — Create the MCP client (`mcp_client.py`)
+
+This module is the bridge between Streamlit and the server:
 
 ```python
-import json
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-
-from mcp.server import MCPServer
-
-mcp = MCPServer(
-    "Weather MCP",
-    instructions="Use get_current_weather to retrieve current weather for a city.",
-)
-
-
-def get_json(url: str) -> dict:
-    """Fetch JSON from a public API with a timeout and a clear error."""
-    request = Request(url, headers={"User-Agent": "python-mcp-weather-lab/1.0"})
-    try:
-        with urlopen(request, timeout=15) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise RuntimeError(f"Weather provider returned HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Could not reach weather provider: {exc.reason}") from exc
-
-
-@mcp.tool()
-def get_current_weather(city: str) -> str:
-    """Get current weather conditions for a city by name."""
-    city = city.strip()
-    if len(city) < 2 or len(city) > 100:
-        raise ValueError("Enter a city name between 2 and 100 characters.")
-
-    geo_query = urlencode(
-        {"name": city, "count": 5, "language": "en", "format": "json"}
-    )
-    locations = get_json(
-        f"https://geocoding-api.open-meteo.com/v1/search?{geo_query}"
-    ).get("results", [])
-    if not locations:
-        return f"No location found for '{city}'. Check the spelling or include a region."
-
-    # Prefer an exact case-insensitive city-name match, otherwise use the first
-    # geocoding result. The country is returned so the user can confirm it.
-    location = next(
-        (item for item in locations if item.get("name", "").casefold() == city.casefold()),
-        locations[0],
-    )
-    forecast_query = urlencode(
-        {
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
-            "current": (
-                "temperature_2m,relative_humidity_2m,apparent_temperature,"
-                "precipitation,weather_code,wind_speed_10m"
-            ),
-            "timezone": "auto",
-        }
-    )
-    payload = get_json(f"https://api.open-meteo.com/v1/forecast?{forecast_query}")
-    current = payload.get("current")
-    if not current:
-        raise RuntimeError("The weather provider returned no current conditions.")
-
-    return json.dumps(
-        {
-            "city": location.get("name"),
-            "region": location.get("admin1"),
-            "country": location.get("country"),
-            "local_time": current.get("time"),
-            "temperature_c": current.get("temperature_2m"),
-            "feels_like_c": current.get("apparent_temperature"),
-            "relative_humidity_percent": current.get("relative_humidity_2m"),
-            "precipitation_mm": current.get("precipitation"),
-            "wind_speed_kmh": current.get("wind_speed_10m"),
-            "weather_code": current.get("weather_code"),
-            "units": payload.get("current_units", {}),
-            "source": "Open-Meteo",
-        },
-        indent=2,
-    )
-
-
-if __name__ == "__main__":
-    mcp.run()
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 ```
 
-## Step 3 — Understand the API sequence
+`call_weather_tool(city, tool_name)` should:
 
-1. The user supplies a city.
-2. The tool validates the name and calls Open-Meteo geocoding.
-3. It selects a matching place and receives latitude/longitude.
-4. It calls the forecast endpoint for current conditions in that location's timezone.
-5. It returns a small JSON result. The AI host can phrase this result naturally.
+1. Build `StdioServerParameters(command=sys.executable, args=[path/to/server.py])`.
+2. Open `stdio_client`, create `ClientSession`, `await session.initialize()`.
+3. `await session.list_tools()` (discovery).
+4. `await session.call_tool(tool_name, {"city": city})`.
+5. Parse text content; for `get_current_weather`, `json.loads` and surface `{"error": ...}` as `ValueError`.
 
-The tool only performs a read. It does not accept an arbitrary URL from the model, which limits SSRF-style risks and keeps the API surface focused.
+See `mcp_client.py` in this repo for the full implementation.
 
-## Step 4 — Test with MCP Inspector
+## Step 4 — Build the Streamlit UI (`app.py`)
 
-```bash
-uv run mcp dev server.py
-```
+The UI should include:
 
-In the Inspector's **Tools** tab:
+- Page title **MCP Weather Assistant** and caption: `Streamlit → MCP Client → MCP Server → Open-Meteo`
+- Form: city text input (default `Pune`), response type radio (**Detailed Weather** / **Travel Weather Brief**)
+- **Get Weather** button
+- On success (detailed): metric cards, optional `st.map` from latitude/longitude, expandable raw JSON
+- On success (brief): display the sentence in a success callout
+- On failure: `st.warning` for validation/unknown city, `st.error` for network/runtime errors
 
-1. Select `get_current_weather`.
-2. Enter `New Delhi` and run it.
-3. Confirm the result contains a city, country, local time, temperature, feels-like temperature, humidity, precipitation, wind speed, weather code, and source.
-4. Try `Pune`, `London`, and an intentionally misspelled city.
-5. Stop the Inspector with `Ctrl+C`.
-
-Expected results vary as weather changes. The misspelled name should return a helpful “No location found” message rather than a Python traceback.
-
-## Step 5 — Call the tool from Python
-
-Create `client.py`:
+Streamlit is synchronous; wrap the async MCP call:
 
 ```python
 import asyncio
-import sys
-from pathlib import Path
 
-from mcp import Client
-from mcp.client.stdio import StdioServerParameters
+def run_mcp(city: str, tool_name: str):
+    return asyncio.run(call_weather_tool(city, tool_name))
+```
 
+## Step 5 — Run the complete application
+
+From the project directory:
+
+```powershell
+uv run streamlit run app.py
+```
+
+Or with an activated venv:
+
+```powershell
+streamlit run app.py
+```
+
+Open [http://localhost:8501](http://localhost:8501), enter a city, choose response type, and click **Get Weather**.
+
+## Step 6 — Expected UI behavior
+
+After a successful **Detailed Weather** request you should see:
+
+- Location heading (city, country, region caption)
+- Metrics: temperature, feels like, humidity, wind, precipitation, weather code
+- A map pin at the resolved coordinates
+- Expandable **Raw JSON from MCP tool**
+
+**Travel Weather Brief** shows a single summary line (with an umbrella hint when precipitation &gt; 0).
+
+Values are **live** from Open-Meteo via MCP (not hard-coded).
+
+## Step 7 — Test the application
+
+| Test | Input                | Expected behavior                         |
+| ---- | -------------------- | ----------------------------------------- |
+| 1    | Pune                 | Detailed metrics and map                  |
+| 2    | New Delhi            | Weather for New Delhi, India              |
+| 3    | London               | Weather with country shown                |
+| 4    | Invalid city name    | Warning: location not found               |
+| 5    | Empty input          | Warning: enter a city name                |
+| 6    | Pune + Travel Brief  | One-sentence summary                      |
+| 7    | Disconnect internet  | Connection / provider error message       |
+
+### Verify Streamlit uses MCP (not Open-Meteo directly)
+
+1. Temporarily rename `server.py` to `server_backup.py`.
+2. Submit a weather request in Streamlit.
+3. Expect an error — the client cannot launch the server.
+4. Restore the filename and retry.
+
+### Optional: MCP Inspector (base Lab 05)
+
+You can still inspect tools in isolation:
+
+```powershell
+uv run mcp dev server.py
+```
+
+Use the **Tools** tab to run `get_current_weather` and `get_weather_brief`. Stop with `Ctrl+C`.
+
+## Step 8 — CLI test (`client.py`)
+
+Independent test without Streamlit:
+
+```python
+import asyncio
+import json
+from mcp_client import call_weather_tool
 
 async def main() -> None:
-    server_file = Path(__file__).with_name("server.py").resolve()
-    async with Client(
-        StdioServerParameters(command=sys.executable, args=[str(server_file)])
-    ) as client:
-        result = await client.call_tool(
-            "get_current_weather", {"city": "Pune"}
-        )
-        print(result.structured_content or result.content)
-
+    result = await call_weather_tool("Pune", "get_current_weather")
+    print(json.dumps(result, indent=2))
+    brief = await call_weather_tool("Pune", "get_weather_brief")
+    print("\nTravel brief:")
+    print(brief)
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -173,36 +238,77 @@ if __name__ == "__main__":
 
 Run:
 
-```bash
+```powershell
 uv run python client.py
 ```
 
-This verifies the MCP server and API without needing a model. An AI host can use the same tool schema and decide when to call it.
+## Step 9 — Execution flow (checkpoint)
 
-## Step 6 — Optional Microsoft Foundry connection
+1. **User** enters a city and clicks **Get Weather**.
+2. **Streamlit** calls `call_weather_tool(city, tool_name)`.
+3. **MCP client** spawns `server.py`, initializes session, discovers tools, invokes the tool.
+4. **MCP server** geocodes the city and calls Open-Meteo.
+5. **Server** returns tool output to the client.
+6. **Streamlit** renders metrics, map, or brief text.
 
-For the Foundry agent to call this tool, deploy the server as a remote HTTPS MCP endpoint using Streamable HTTP and configure the endpoint in the Foundry agent as described in Lab 01. The endpoint must be reachable from Foundry and protected with an authentication method supported by the current Foundry MCP integration. Use approval while learning. Do not assume a local `localhost` server is accessible to a cloud agent.
+## Checkpoint questions
 
-To run the same server with HTTP during local development, replace `mcp.run()` with:
+1. Why should `app.py` avoid importing `fetch_weather` from `server.py`?
+2. What transport does this lab use, and who starts the server process?
+3. What is the difference between `get_current_weather` and `get_weather_brief` for the UI?
+4. Why must debugging output avoid `print()` on stdout in stdio mode?
+
+## Further enhancements
+
+| Current application              | Future AI weather assistant              |
+| -------------------------------- | ---------------------------------------- |
+| User enters a city               | Natural-language question                |
+| User selects MCP tool in UI      | Agent selects tool                       |
+| Structured JSON / brief          | Natural-language explanation             |
+| Streamlit + MCP                  | Streamlit + LLM + MCP                    |
+| No model required                | LLM integration                          |
+
+Possible next steps on the server side:
+
+- `get_weather_forecast` for multi-day outlook
+- Weather-code → human-readable labels in the detailed view
+- City disambiguation (country/region parameter)
+- Caching and rate limiting for Open-Meteo
+
+**Production note:** stdio + one subprocess per request is fine for learning. For multiple users, use a **persistent** MCP service over **Streamable HTTP** with authentication instead of spawning `server.py` on every click.
+
+Example local HTTP transport (comparison only — not used by this Streamlit lab):
 
 ```python
+if __name__ == "__main__":
     mcp.run(transport="streamable-http", host="127.0.0.1", port=8000)
 ```
 
-Then use MCP Inspector or an HTTP MCP client against `http://127.0.0.1:8000/mcp`. Use HTTPS and an authenticated deployment before connecting remotely.
-
-## Step 7 — Add a business-friendly tool (challenge)
-
-Add `get_weather_brief(city: str) -> str` that calls the existing provider logic and returns one sentence suitable for a travel coordinator, while preserving the numeric values and city/country. Refactor the API logic into a helper so the two MCP tools do not duplicate calls or validation.
+See [Lab 04](https://github.com/UID-Technologies/training-ai-foundary/blob/master/Labs/Lab-04%20-%20First%20MCP%20Server%20and%20Foundry.md) and base Lab 05 for Foundry remote endpoint guidance.
 
 ## Troubleshooting
 
-- **Network timeout** — verify internet access; the example gives each API request 15 seconds.
-- **Several cities with the same name** — inspect the returned country/region; extend the tool input with a country or region filter.
-- **HTTP 429 or provider errors** — retry later, reduce call volume, and check Open-Meteo's current usage terms.
-- `mcp` **import error** — use `uv run` or activate the virtual environment where the dependency was installed.
-- **Inspector needs Node** — use the Python client instead.
+| Issue | What to try |
+| ----- | ----------- |
+| `uv` not recognized | Install uv; add `%USERPROFILE%\.local\bin` to Path; open a new terminal |
+| `ModuleNotFoundError: mcp` | Run commands with `uv run` or activate `.venv` |
+| `ModuleNotFoundError: streamlit` | `uv add streamlit` or `pip install streamlit` |
+| Streamlit hangs on first request | Normal — cold-start spawns MCP server; check firewall for Open-Meteo HTTPS |
+| Network timeout | Verify internet; geocoding/forecast use 15s timeout |
+| Several cities same name | Check country/region in JSON; extend tool with optional region |
+| Generic MCP tool error | Ensure server tools catch `ValueError`/`RuntimeError` and return messages |
+| Inspector needs Node | Use `client.py` or Streamlit instead |
+| Stdio garbled / broken MCP | Remove `print()` from `server.py`; use `logging` instead |
 
 ## Cleanup
 
-Stop the server/Inspector and delete the `mcp-weather-lab` directory when finished.
+1. Stop Streamlit (`Ctrl+C` in the terminal).
+2. Delete the `mcp-weather-lab` folder when finished, or keep it for Lab 06+ MCP patterns.
+
+## Quick reference — one command start
+
+```powershell
+uv run streamlit run app.py
+```
+
+No Azure account, AI model, or paid weather API is required for this exercise.
